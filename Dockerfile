@@ -9,13 +9,13 @@ COPY hospital/pom.xml ./hospital/
 
 WORKDIR /app/hospital
 
-# Download dependencies (cached layer if pom.xml doesn't change)
-RUN mvn dependency:go-offline -B || true
+# Download PostgreSQL dependencies only. The default Maven profile is MySQL for local PCs.
+RUN mvn dependency:go-offline -B -Preactive-pg,'!reactive-mysql' || true
 
 # Copy source code
 COPY hospital/src ./src
 
-# Build for Render: PostgreSQL reactive client + prod Quarkus profile
+# Render image: PostgreSQL only, production profile. Local quarkus:dev keeps the default MySQL profile.
 RUN mvn clean package -DskipTests -B -Preactive-pg,'!reactive-mysql' -Dquarkus.profile=prod
 
 # ================================
@@ -39,6 +39,9 @@ USER appuser
 
 # Expose port (Render will use this)
 EXPOSE 8080
+
+# This image is the online server. Local runs do not use this image.
+ENV QUARKUS_PROFILE=prod
 
 # Render health check: /health_care/health
 # Set QUARKUS_PROFILE=prod and datasource env vars on the service

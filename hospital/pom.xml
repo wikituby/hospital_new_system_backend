@@ -100,19 +100,9 @@
         <groupId>io.quarkus</groupId>
         <artifactId>quarkus-scheduler</artifactId>
     </dependency>
-    <dependency>
-        <groupId>io.quarkus</groupId>
-        <artifactId>quarkus-jdbc-mysql</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>io.quarkus</groupId>
-        <artifactId>quarkus-reactive-mysql-client</artifactId>
-    </dependency>
-    <!-- Render / Supabase production (JDBC always; reactive client via Maven profile) -->
-    <!-- postgresql-removed-for-local <dependency>
-        <groupId>io.quarkus</groupId>
-        <artifactId>quarkus-jdbc-postgresql</artifactId>
-    </dependency> -->
+    <!-- Database drivers live in Maven profiles.
+         Default profile reactive-mysql: this PC, MySQL.
+         Profile reactive-pg: Render image, PostgreSQL only. -->
     <dependency>
         <groupId>io.quarkus</groupId>
         <artifactId>quarkus-rest-jsonb</artifactId>
@@ -262,6 +252,10 @@
             <activeByDefault>true</activeByDefault>
         </activation>
         <dependencies>
+            <dependency>
+                <groupId>io.quarkus</groupId>
+                <artifactId>quarkus-jdbc-mysql</artifactId>
+            </dependency>
             <dependency>
                 <groupId>io.quarkus</groupId>
                 <artifactId>quarkus-reactive-mysql-client</artifactId>
