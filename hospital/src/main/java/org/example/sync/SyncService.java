@@ -332,22 +332,21 @@ public class SyncService {
             if (id == null) {
                 return;
             }
-            Object existing = entityManager.find(type, id);
+            boolean exists = entityManager.createQuery(
+                            "select count(e.id) from " + type.getSimpleName() + " e where e.id = :id", Long.class)
+                    .setParameter("id", id)
+                    .getSingleResult() > 0L;
             if ("DELETE".equalsIgnoreCase(operation)) {
-                if (existing != null) {
-                    entityManager.remove(existing);
+                if (exists) {
+                    entityManager.createQuery("delete from " + type.getSimpleName() + " e where e.id = :id")
+                            .setParameter("id", id)
+                            .executeUpdate();
                 }
                 return;
             }
-            Object target = existing;
-            boolean created = false;
-            if (target == null) {
-                target = type.getDeclaredConstructor().newInstance();
-                writeField(target, "id", id);
-                created = true;
-            } else {
-                entityManager.detach(target);
-            }
+            Object target = type.getDeclaredConstructor().newInstance();
+            writeField(target, "id", id);
+            boolean created = !exists;
             for (String name : json.keySet()) {
                 if ("id".equals(name) || name.startsWith("$")) {
                     continue;
