@@ -158,6 +158,64 @@ public class SyncService {
     }
 
     @Transactional(Transactional.TxType.REQUIRES_NEW)
+    public List<Map<String, Object>> pendingFor(String peerKey, int limit) {
+        List<SyncEvent> rows = entityManager.createQuery(
+                        "select e from SyncEvent e where not exists ("
+                                + "select d.id from SyncDelivery d where d.eventUid = e.eventUid and d.peerKey = :peer"
+                                + ") order by e.id",
+                        SyncEvent.class)
+                .setParameter("peer", peerKey)
+                .setMaxResults(Math.max(1, limit))
+                .getResultList();
+        List<Map<String, Object>> events = new ArrayList<>();
+        for (SyncEvent row : rows) {
+            events.add(toEventMap(row));
+        }
+        return events;
+    }
+
+    @Transactional(Transactional.TxType.REQUIRES_NEW)
+    public void markDelivered(String peerKey, List<String> eventUids) {
+        if (peerKey == null || peerKey.isBlank() || eventUids == null) {
+            return;
+        }
+        for (String uid : eventUids) {
+            if (uid == null || uid.isBlank()) {
+                continue;
+            }
+            long existing = SyncDelivery.count("eventUid = ?1 and peerKey = ?2", uid, peerKey);
+            if (existing > 0) {
+                continue;
+            }
+            SyncDelivery delivery = new SyncDelivery();
+            delivery.eventUid = uid;
+            delivery.peerKey = peerKey;
+            delivery.persist();
+        }
+    }
+
+    /** Older rows were marked pushed before each peer was tracked separately. */
+    @Transactional(Transactional.TxType.REQUIRES_NEW)
+    public void ackPushedWithoutDelivery(String peerKey) {
+        if (peerKey == null || peerKey.isBlank()) {
+            return;
+        }
+        List<SyncEvent> rows = SyncEvent.list("pushed", true);
+        for (SyncEvent row : rows) {
+            if (row.eventUid == null) {
+                continue;
+            }
+            if (SyncDelivery.count("eventUid", row.eventUid) > 0) {
+                continue;
+            }
+            SyncDelivery delivery = new SyncDelivery();
+            delivery.eventUid = row.eventUid;
+            delivery.peerKey = peerKey;
+            delivery.persist();
+        }
+    }
+
+    @Transactional(Transactional.TxType.REQUIRES_NEW)
     public List<Map<String, Object>> unpushed(int limit) {
         List<SyncEvent> rows = SyncEvent.find("pushed = false order by id").page(0, limit).list();
         List<Map<String, Object>> events = new ArrayList<>();
@@ -289,7 +347,12 @@ public class SyncService {
                 created = true;
             }
             for (String name : json.keySet()) {
-                if ("id".equals(name)) {
+                if ("id".equals(name) || name.startsWith("$")) {
+                    continue;
+                }
+                Field field = findField(target.getClass(), name);
+                if (field != null && !isSimple(field.getType())) {
+                    writeAssociation(target, field, json.get(name));
                     continue;
                 }
                 writeSimple(target, name, json.get(name));
@@ -315,20 +378,22 @@ public class SyncService {
                 (org.hibernate.persister.entity.AbstractEntityPersister) factory.getRuntimeMetamodels()
                         .getMappingMetamodel()
                         .getEntityDescriptor(Hibernate.getClass(target));
-        char open = factory.getJdbcServices().getDialect().openQuote();
-        char close = factory.getJdbcServices().getDialect().closeQuote();
+        org.hibernate.dialect.Dialect dialect = factory.getJdbcServices().getDialect();
+        boolean postgres = dialect instanceof org.hibernate.dialect.PostgreSQLDialect;
+        char open = dialect.openQuote();
+        char close = dialect.closeQuote();
         List<String> columns = new ArrayList<>();
         List<Object> values = new ArrayList<>();
-        addAssignedColumn(target, persister.getIdentifierPropertyName(), persister.getIdentifierColumnNames()[0], columns, values, open, close);
+        addAssignedColumn(target, persister.getIdentifierPropertyName(), persister.getIdentifierColumnNames()[0], columns, values, postgres, open, close);
         for (String name : persister.getPropertyNames()) {
             String[] propertyColumns = persister.getPropertyColumnNames(name);
             if (propertyColumns.length == 0 || propertyColumns[0] == null || propertyColumns[0].isBlank()) {
                 continue;
             }
-            addAssignedColumn(target, name, propertyColumns[0], columns, values, open, close);
+            addAssignedColumn(target, name, propertyColumns[0], columns, values, postgres, open, close);
         }
         StringBuilder sql = new StringBuilder("INSERT INTO ")
-                .append(quoteIdent(persister.getTableName(), open, close))
+                .append(sqlIdent(persister.getTableName(), postgres, open, close))
                 .append(" (");
         StringBuilder marks = new StringBuilder();
         for (int i = 0; i < columns.size(); i++) {
@@ -353,29 +418,58 @@ public class SyncService {
             String column,
             List<String> columns,
             List<Object> values,
+            boolean postgres,
             char open,
             char close) throws IllegalAccessException {
         Field field = findField(target.getClass(), fieldName);
-        if (field == null || !isSimple(field.getType())) {
+        if (field == null) {
             return;
         }
         field.setAccessible(true);
         Object value = field.get(target);
+        if (!isSimple(field.getType())) {
+            value = associationId(value);
+        }
         if (value == null) {
             return;
         }
-        columns.add(quoteIdent(column, open, close));
+        columns.add(sqlIdent(column, postgres, open, close));
         values.add(value);
     }
 
-    private static String quoteIdent(String name, char open, char close) {
+    private static String sqlIdent(String name, boolean postgres, char open, char close) {
         if (name == null) {
             return "";
         }
-        if (name.indexOf(open) >= 0) {
-            return name;
+        String trimmed = name.trim();
+        if (trimmed.isEmpty()) {
+            return trimmed;
         }
-        return open + name + close;
+        if (trimmed.charAt(0) == open || trimmed.charAt(0) == '"') {
+            return trimmed;
+        }
+        if (postgres) {
+            String lower = trimmed.toLowerCase(java.util.Locale.ROOT);
+            if ("user".equals(lower) || "order".equals(lower) || "group".equals(lower)) {
+                return "\"" + lower + "\"";
+            }
+            return lower;
+        }
+        return open + trimmed + close;
+    }
+
+    private void writeAssociation(Object target, Field field, JsonValue value) {
+        Object id = coerceId(value);
+        if (id == null) {
+            return;
+        }
+        try {
+            Object ref = entityManager.getReference(field.getType(), id);
+            field.setAccessible(true);
+            field.set(target, ref);
+        } catch (Exception ignored) {
+            // A link the model cannot store is left empty.
+        }
     }
 
     private static String toPayload(Object entity) throws IllegalAccessException {
@@ -383,14 +477,14 @@ public class SyncService {
         Class<?> type = entity.getClass();
         while (type != null && type != Object.class) {
             for (Field field : type.getDeclaredFields()) {
-                if (Modifier.isStatic(field.getModifiers()) || field.isSynthetic()) {
-                    continue;
-                }
-                if (!isSimple(field.getType())) {
+                if (Modifier.isStatic(field.getModifiers()) || field.isSynthetic() || field.getName().startsWith("$")) {
                     continue;
                 }
                 field.setAccessible(true);
                 Object value = field.get(entity);
+                if (!isSimple(field.getType())) {
+                    value = associationId(value);
+                }
                 if (value == null) {
                     continue;
                 }
@@ -438,6 +532,28 @@ public class SyncService {
             builder.add(name, en.name());
         } else {
             builder.add(name, String.valueOf(value));
+        }
+    }
+
+    private static Object associationId(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof org.hibernate.proxy.HibernateProxy proxy) {
+            return proxy.getHibernateLazyInitializer().getIdentifier();
+        }
+        if (isSimple(value.getClass()) || value.getClass().isArray() || value instanceof java.util.Collection<?>) {
+            return null;
+        }
+        try {
+            Field idField = findField(Hibernate.getClass(value), "id");
+            if (idField == null) {
+                return null;
+            }
+            idField.setAccessible(true);
+            return idField.get(value);
+        } catch (Exception ex) {
+            return null;
         }
     }
 
