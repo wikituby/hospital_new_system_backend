@@ -1,0 +1,27 @@
+# Build
+**/target/
+hospital/target/
+
+# Logs
+*.log
+logs/
+backend*.log
+build.log
+**/static/error-logs/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local secrets / env dumps
+.env
+.env.*
+render-db.json
+hospital/certs/
+*.p12
+*.pass
