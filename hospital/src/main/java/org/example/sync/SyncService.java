@@ -345,6 +345,8 @@ public class SyncService {
                 target = type.getDeclaredConstructor().newInstance();
                 writeField(target, "id", id);
                 created = true;
+            } else {
+                entityManager.detach(target);
             }
             for (String name : json.keySet()) {
                 if ("id".equals(name) || name.startsWith("$")) {
@@ -359,6 +361,8 @@ public class SyncService {
             }
             if (created) {
                 insertAssigned(target);
+            } else {
+                updateAssigned(target);
             }
         } catch (Exception ex) {
             LOG.warnf("Sync apply failed %s %s: %s", operation, entityType, ex.getMessage());
@@ -405,11 +409,70 @@ public class SyncService {
             marks.append('?');
         }
         sql.append(") VALUES (").append(marks).append(')');
-        var query = entityManager.createNativeQuery(sql.toString());
+        bindAndExecute(sql.toString(), values);
+    }
+
+    /** Writes changed columns directly so a later edit is stored, not only the first insert. */
+    private void updateAssigned(Object target) throws IllegalAccessException {
+        AssignedWrite write = assignedWrite(target);
+        if (write.columns.size() < 2) {
+            return;
+        }
+        StringBuilder sql = new StringBuilder("UPDATE ")
+                .append(write.table)
+                .append(" SET ");
+        List<Object> values = new ArrayList<>();
+        boolean first = true;
+        for (int i = 1; i < write.columns.size(); i++) {
+            if (!first) {
+                sql.append(',');
+            }
+            first = false;
+            sql.append(write.columns.get(i)).append("=?");
+            values.add(write.values.get(i));
+        }
+        sql.append(" WHERE ").append(write.columns.get(0)).append("=?");
+        values.add(write.values.get(0));
+        bindAndExecute(sql.toString(), values);
+    }
+
+    private void bindAndExecute(String sql, List<Object> values) {
+        var query = entityManager.createNativeQuery(sql);
         for (int i = 0; i < values.size(); i++) {
             query.setParameter(i + 1, values.get(i));
         }
         query.executeUpdate();
+    }
+
+    private AssignedWrite assignedWrite(Object target) throws IllegalAccessException {
+        org.hibernate.Session session = entityManager.unwrap(org.hibernate.Session.class);
+        org.hibernate.engine.spi.SessionFactoryImplementor factory = session.getSessionFactory()
+                .unwrap(org.hibernate.engine.spi.SessionFactoryImplementor.class);
+        org.hibernate.persister.entity.AbstractEntityPersister persister =
+                (org.hibernate.persister.entity.AbstractEntityPersister) factory.getRuntimeMetamodels()
+                        .getMappingMetamodel()
+                        .getEntityDescriptor(Hibernate.getClass(target));
+        org.hibernate.dialect.Dialect dialect = factory.getJdbcServices().getDialect();
+        boolean postgres = dialect instanceof org.hibernate.dialect.PostgreSQLDialect;
+        char open = dialect.openQuote();
+        char close = dialect.closeQuote();
+        AssignedWrite write = new AssignedWrite();
+        write.table = sqlIdent(persister.getTableName(), postgres, open, close);
+        addAssignedColumn(target, persister.getIdentifierPropertyName(), persister.getIdentifierColumnNames()[0], write.columns, write.values, postgres, open, close);
+        for (String name : persister.getPropertyNames()) {
+            String[] propertyColumns = persister.getPropertyColumnNames(name);
+            if (propertyColumns.length == 0 || propertyColumns[0] == null || propertyColumns[0].isBlank()) {
+                continue;
+            }
+            addAssignedColumn(target, name, propertyColumns[0], write.columns, write.values, postgres, open, close);
+        }
+        return write;
+    }
+
+    private static final class AssignedWrite {
+        String table;
+        final List<String> columns = new ArrayList<>();
+        final List<Object> values = new ArrayList<>();
     }
 
     private static void addAssignedColumn(
