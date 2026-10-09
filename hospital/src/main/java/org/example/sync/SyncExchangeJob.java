@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
@@ -43,6 +44,7 @@ public class SyncExchangeJob {
     long exchangeSeconds;
 
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
+    private final AtomicBoolean pending = new AtomicBoolean(false);
     private ScheduledExecutorService executor;
 
     void onStart(@Observes StartupEvent event) {
@@ -56,8 +58,24 @@ public class SyncExchangeJob {
             thread.setDaemon(true);
             return thread;
         });
-        executor.scheduleWithFixedDelay(this::exchange, 20, delay, TimeUnit.SECONDS);
-        LOG.infof("Sync will call %s every %s seconds", peerBaseUrl, delay);
+        executor.scheduleWithFixedDelay(this::exchange, 5, delay, TimeUnit.SECONDS);
+        LOG.infof("Sync sends to %s about a second after each save, and retries every %s seconds", peerBaseUrl, delay);
+    }
+
+    /**
+     * Uploads the change that just committed. A short wait lets one save
+     * send the client and its related rows together.
+     */
+    public void syncSoon() {
+        if (!configured(peerBaseUrl) || executor == null) {
+            return;
+        }
+        if (pending.compareAndSet(false, true)) {
+            executor.schedule(() -> {
+                pending.set(false);
+                exchange();
+            }, 1, TimeUnit.SECONDS);
+        }
     }
 
     void exchange() {
@@ -68,28 +86,36 @@ public class SyncExchangeJob {
                 LOG.warnf("Sync peer health returned %s", health.statusCode());
                 return;
             }
+            pushOutgoing(base);
             long after = syncService.cursor(base);
             String pullUrl = base + "/sync/pull?deviceId=" + encode(deviceId) + "&afterId=" + after;
             HttpResponse<String> pulled = http.send(request(pullUrl).GET().build(), HttpResponse.BodyHandlers.ofString());
             if (pulled.statusCode() == 200) {
                 applyPulled(base, pulled.body());
             }
-            List<Map<String, Object>> outgoing = syncService.unpushed(200);
-            if (!outgoing.isEmpty()) {
-                String json = toPushBody(outgoing);
-                HttpResponse<String> pushed = http.send(
-                        request(base + "/sync/push").POST(HttpRequest.BodyPublishers.ofString(json)).build(),
-                        HttpResponse.BodyHandlers.ofString());
-                if (pushed.statusCode() == 200) {
-                    List<String> ids = new ArrayList<>();
-                    for (Map<String, Object> event : outgoing) {
-                        ids.add(String.valueOf(event.get("id")));
-                    }
-                    syncService.markPushed(ids);
-                }
-            }
         } catch (Exception ex) {
             LOG.warnf("Sync exchange skipped: %s", ex.getMessage());
+        }
+    }
+
+    private void pushOutgoing(String base) throws Exception {
+        List<Map<String, Object>> outgoing = syncService.unpushed(200);
+        if (outgoing.isEmpty()) {
+            return;
+        }
+        String json = toPushBody(outgoing);
+        HttpResponse<String> pushed = http.send(
+                request(base + "/sync/push").POST(HttpRequest.BodyPublishers.ofString(json)).build(),
+                HttpResponse.BodyHandlers.ofString());
+        if (pushed.statusCode() == 200) {
+            List<String> ids = new ArrayList<>();
+            for (Map<String, Object> event : outgoing) {
+                ids.add(String.valueOf(event.get("id")));
+            }
+            syncService.markPushed(ids);
+            LOG.infof("Sync sent %s change(s)", ids.size());
+        } else {
+            LOG.warnf("Sync push returned %s", pushed.statusCode());
         }
     }
 
@@ -145,9 +171,10 @@ public class SyncExchangeJob {
     }
 
     private HttpRequest.Builder request(String url) {
+        String accept = url.endsWith("/health") ? "text/plain" : "application/json";
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofSeconds(60))
-                .header("Accept", "application/json");
+                .header("Accept", accept);
         if (configured(apiKey)) {
             builder.header("X-Sync-Key", apiKey.trim());
         }

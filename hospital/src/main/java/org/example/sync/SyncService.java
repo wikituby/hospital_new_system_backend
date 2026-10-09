@@ -43,13 +43,13 @@ public class SyncService {
     String deviceId;
 
     @Transactional(Transactional.TxType.REQUIRES_NEW)
-    public void recordLocal(Object entity, String operation) {
+    public boolean recordLocal(Object entity, String operation) {
         if (entity == null || SyncGuard.isApplying()) {
-            return;
+            return false;
         }
         Class<?> type = Hibernate.getClass(entity);
         if (type.getName().startsWith("org.example.sync.")) {
-            return;
+            return false;
         }
         try {
             String payload = toPayload(entity);
@@ -65,8 +65,10 @@ public class SyncService {
             row.pushed = false;
             row.persist();
             foldIfNeeded();
+            return true;
         } catch (Exception ex) {
             LOG.warnf(ex, "Sync log skipped for %s", type.getName());
+            return false;
         }
     }
 
@@ -293,11 +295,87 @@ public class SyncService {
                 writeSimple(target, name, json.get(name));
             }
             if (created) {
-                entityManager.persist(target);
+                insertAssigned(target);
             }
         } catch (Exception ex) {
-            LOG.warnf("Sync apply stored the event but skipped %s %s: %s", operation, entityType, ex.getMessage());
+            LOG.warnf("Sync apply failed %s %s: %s", operation, entityType, ex.getMessage());
+            throw new IllegalStateException(ex);
         }
+    }
+
+    /**
+     * Stores a new row under the id it already has on the other server.
+     * A normal persist() refuses that because this app generates ids itself.
+     */
+    private void insertAssigned(Object target) throws IllegalAccessException {
+        org.hibernate.Session session = entityManager.unwrap(org.hibernate.Session.class);
+        org.hibernate.engine.spi.SessionFactoryImplementor factory = session.getSessionFactory()
+                .unwrap(org.hibernate.engine.spi.SessionFactoryImplementor.class);
+        org.hibernate.persister.entity.AbstractEntityPersister persister =
+                (org.hibernate.persister.entity.AbstractEntityPersister) factory.getRuntimeMetamodels()
+                        .getMappingMetamodel()
+                        .getEntityDescriptor(Hibernate.getClass(target));
+        char open = factory.getJdbcServices().getDialect().openQuote();
+        char close = factory.getJdbcServices().getDialect().closeQuote();
+        List<String> columns = new ArrayList<>();
+        List<Object> values = new ArrayList<>();
+        addAssignedColumn(target, persister.getIdentifierPropertyName(), persister.getIdentifierColumnNames()[0], columns, values, open, close);
+        for (String name : persister.getPropertyNames()) {
+            String[] propertyColumns = persister.getPropertyColumnNames(name);
+            if (propertyColumns.length == 0 || propertyColumns[0] == null || propertyColumns[0].isBlank()) {
+                continue;
+            }
+            addAssignedColumn(target, name, propertyColumns[0], columns, values, open, close);
+        }
+        StringBuilder sql = new StringBuilder("INSERT INTO ")
+                .append(quoteIdent(persister.getTableName(), open, close))
+                .append(" (");
+        StringBuilder marks = new StringBuilder();
+        for (int i = 0; i < columns.size(); i++) {
+            if (i > 0) {
+                sql.append(',');
+                marks.append(',');
+            }
+            sql.append(columns.get(i));
+            marks.append('?');
+        }
+        sql.append(") VALUES (").append(marks).append(')');
+        var query = entityManager.createNativeQuery(sql.toString());
+        for (int i = 0; i < values.size(); i++) {
+            query.setParameter(i + 1, values.get(i));
+        }
+        query.executeUpdate();
+    }
+
+    private static void addAssignedColumn(
+            Object target,
+            String fieldName,
+            String column,
+            List<String> columns,
+            List<Object> values,
+            char open,
+            char close) throws IllegalAccessException {
+        Field field = findField(target.getClass(), fieldName);
+        if (field == null || !isSimple(field.getType())) {
+            return;
+        }
+        field.setAccessible(true);
+        Object value = field.get(target);
+        if (value == null) {
+            return;
+        }
+        columns.add(quoteIdent(column, open, close));
+        values.add(value);
+    }
+
+    private static String quoteIdent(String name, char open, char close) {
+        if (name == null) {
+            return "";
+        }
+        if (name.indexOf(open) >= 0) {
+            return name;
+        }
+        return open + name + close;
     }
 
     private static String toPayload(Object entity) throws IllegalAccessException {
